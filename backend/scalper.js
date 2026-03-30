@@ -1,6 +1,6 @@
 // ================================================================
-// scalper.js — Moteur de scalping v1.4 (bugfixes)
-// Architecture: boucles SÉPARÉES pour TP/SL (rapide) et analyse (lent)
+// scalper.js — Moteur de scalping v1.5
+// FIXES: timeout réduit, sync positions Binance, debug TP/SL
 // ================================================================
 const binance = require('./binance-futures');
 const { scalpAnalyze } = require('./scalp-strategy');
@@ -38,13 +38,14 @@ class Scalper {
     this._posCounter   = 0;
     this.stats = { totalPnl:0, wins:0, losses:0, bestTrade:0, worstTrade:0, totalTrades:0, longTrades:0, shortTrades:0, totalDuration:0, avgDuration:0 };
 
-    // ── FIX: Verrou par paire pour éviter les doubles ouvertures (race condition) ──
+    // Verrou par paire
     this._openingPairs = new Set();
 
     // Timers séparés
     this._priceTimer  = null;
     this._scanTimer   = null;
     this._candleTimer = null;
+    this._syncTimer   = null;  // ── NOUVEAU: sync positions depuis Binance toutes les 30s
 
     this.wsListeners = new Set();
   }
@@ -78,10 +79,13 @@ class Scalper {
       this.isRunning = true;
       this._broadcast({ type: 'STATUS', data: { running: true, balance: this.balance } });
       logger.info(`✅ Scalper prêt | Balance: ${this.balance.toFixed(2)} USDT`);
+      logger.info(`📋 Config: TP=${(this.tpPct*100).toFixed(2)}% SL=${(this.slPct*100).toFixed(2)}% Trailing=${this.trailingStop}`);
 
       this._priceTimer  = setInterval(() => this._priceAndTPSLLoop(), 1500);
       this._scanTimer   = setInterval(() => this._analysisLoop(), this.scanInterval);
       this._candleTimer = setInterval(() => this._loadCandles(), 30000);
+      // ── NOUVEAU: Sync positions réelles depuis Binance toutes les 60s ──
+      this._syncTimer   = setInterval(() => this._syncPositionsFromBinance(), 60000);
 
       await this._analysisLoop();
 
@@ -98,6 +102,7 @@ class Scalper {
     clearInterval(this._priceTimer);
     clearInterval(this._scanTimer);
     clearInterval(this._candleTimer);
+    clearInterval(this._syncTimer);
     logger.info(`🛑 Scalper arrêté | P&L: ${this.stats.totalPnl >= 0 ? '+' : ''}${this.stats.totalPnl.toFixed(4)}$`);
     this._broadcast({ type: 'STATUS', data: { running: false } });
     return { success: true };
@@ -112,6 +117,69 @@ class Scalper {
   }
 
   // ================================================================
+  // SYNC POSITIONS DEPUIS BINANCE (détection de désync)
+  // ================================================================
+  async _syncPositionsFromBinance() {
+    if (!this.isRunning || this.positions.size === 0) return;
+    try {
+      const binancePositions = await binance.getOpenPositions();
+      const binanceSymbols = new Set(binancePositions.map(p => p.symbol));
+
+      for (const [id, pos] of this.positions) {
+        if (!binanceSymbols.has(pos.symbol)) {
+          logger.warn(`⚠️ DÉSYNC: Position ${pos.symbol} dans le bot mais pas sur Binance — fermeture forcée`);
+          const price = this.pairData[pos.symbol]?.price || pos.entryPrice;
+          // Forcer la fermeture comptable sans appel API (position déjà fermée sur Binance)
+          this._recordClosedTrade(pos, price, 'SYNC_FORCE');
+        }
+      }
+    } catch (err) {
+      logger.warn(`Sync Binance: ${err.message}`);
+    }
+  }
+
+  // Enregistrer une fermeture sans appel API Binance
+  _recordClosedTrade(pos, exitPrice, reason) {
+    if (!this.positions.has(pos.id)) return;
+    this.positions.delete(pos.id);
+
+    const leverage = parseInt(process.env.LEVERAGE || 3);
+    const pnl = pos.side === 'LONG'
+      ? (exitPrice - pos.entryPrice) / pos.entryPrice * pos.amount * leverage
+      : (pos.entryPrice - exitPrice) / pos.entryPrice * pos.amount * leverage;
+    const pnlPct = pnl / pos.amount * 100;
+    const duration = Date.now() - pos.openTime;
+
+    this.stats.totalPnl += pnl;
+    this.dailyPnl += pnl;
+    this.stats.totalTrades++;
+    this.stats.totalDuration += duration;
+    this.stats.avgDuration = this.stats.totalDuration / this.stats.totalTrades;
+    if (pos.side === 'LONG') this.stats.longTrades++; else this.stats.shortTrades++;
+    if (pnl > 0) { this.stats.wins++; if (pnl > this.stats.bestTrade) this.stats.bestTrade = pnl; }
+    else { this.stats.losses++; if (pnl < this.stats.worstTrade) this.stats.worstTrade = pnl; }
+
+    const trade = {
+      id: pos.id, symbol: pos.symbol, side: pos.side,
+      entryPrice: pos.entryPrice, exitPrice,
+      qty: pos.qty, amount: pos.amount,
+      pnl: parseFloat(pnl.toFixed(4)),
+      pnlPct: parseFloat(pnlPct.toFixed(3)),
+      duration, reason,
+      openTime: pos.openTime, closeTime: Date.now(),
+    };
+
+    this.trades.unshift(trade);
+    if (this.trades.length > 200) this.trades.pop();
+
+    const emoji = pnl >= 0 ? '✅' : '❌';
+    const sign  = pnl >= 0 ? '+' : '';
+    logger.info(`${emoji} CLOSE(SYNC) ${pos.side} ${pos.symbol} @ ${exitPrice} | P&L: ${sign}${pnl.toFixed(4)}$ | ${reason} | ${Math.floor(duration/1000)}s`);
+    tradeLogger.info({ event:'CLOSE', ...trade, timestamp:new Date().toISOString() });
+    this._broadcast({ type:'POSITION_CLOSE', data:{ trade, stats:this.stats } });
+  }
+
+  // ================================================================
   // BOUCLE 1 — PRIX + TP/SL (1.5s)
   // ================================================================
   async _priceAndTPSLLoop() {
@@ -119,11 +187,9 @@ class Scalper {
     try {
       await this._fetchPrices();
 
-      // ── FIX: Itérer sur une copie des valeurs pour éviter les mutations pendant l'itération ──
       const openPositions = [...this.positions.values()];
 
       for (const pos of openPositions) {
-        // ── FIX: Re-vérifier que la position existe toujours (peut avoir été fermée en parallèle) ──
         if (!this.positions.has(pos.id)) continue;
 
         const price = this.pairData[pos.symbol]?.price;
@@ -136,10 +202,25 @@ class Scalper {
           ? (price - pos.entryPrice) / pos.entryPrice * pos.amount * leverage
           : (pos.entryPrice - price) / pos.entryPrice * pos.amount * leverage;
 
+        const age = Date.now() - pos.openTime;
+        const ageMin = Math.floor(age / 60000);
+        const ageSec = Math.floor(age / 1000);
+
+        // ── DEBUG: Log de l'état de chaque position toutes les 30s ──
+        if (ageSec % 30 === 0 && ageSec > 0) {
+          const distToTP = pos.side === 'LONG'
+            ? ((pos.tpPrice - price) / price * 100).toFixed(4)
+            : ((price - pos.tpPrice) / price * 100).toFixed(4);
+          const distToSL = pos.side === 'LONG'
+            ? ((price - pos.slPrice) / price * 100).toFixed(4)
+            : ((pos.slPrice - price) / price * 100).toFixed(4);
+          logger.info(`📍 ${pos.symbol} ${pos.side} | prix:${price} entrée:${pos.entryPrice} | TP:${pos.tpPrice.toFixed(4)}(dist:${distToTP}%) SL:${pos.slPrice.toFixed(4)}(dist:${distToSL}%) | PnL:${pos.currentPnl.toFixed(4)}$ | âge:${ageMin}min`);
+        }
+
         // TAKE PROFIT
         const tpHit = pos.side === 'LONG' ? price >= pos.tpPrice : price <= pos.tpPrice;
         if (tpHit) {
-          logger.info(`🎯 TP ${pos.symbol} ${pos.side} @ ${price} | TP: ${pos.tpPrice}`);
+          logger.info(`🎯 TP HIT ${pos.symbol} ${pos.side} | prix:${price} TP:${pos.tpPrice}`);
           await this._closePosition(pos, price, 'TAKE_PROFIT');
           continue;
         }
@@ -147,7 +228,7 @@ class Scalper {
         // STOP LOSS
         const slHit = pos.side === 'LONG' ? price <= pos.slPrice : price >= pos.slPrice;
         if (slHit) {
-          logger.warn(`🛡️ SL ${pos.symbol} ${pos.side} @ ${price} | SL: ${pos.slPrice}`);
+          logger.warn(`🛡️ SL HIT ${pos.symbol} ${pos.side} | prix:${price} SL:${pos.slPrice}`);
           await this._closePosition(pos, price, 'STOP_LOSS');
           continue;
         }
@@ -178,21 +259,24 @@ class Scalper {
             ? (pos.trailSL > pos.slPrice && price <= pos.trailSL)
             : (pos.trailSL < pos.slPrice && price >= pos.trailSL);
           if (trailHit) {
-            logger.info(`📈 TRAIL SL ${pos.symbol} @ ${price}`);
+            logger.info(`🔔 TRAIL SL HIT ${pos.symbol} @ ${price} | trailSL:${pos.trailSL.toFixed(4)}`);
             await this._closePosition(pos, price, 'TRAILING_SL');
             continue;
           }
         }
 
-        // TIMEOUT: 10min en profit → fermer | 15min force
-        const age = Date.now() - pos.openTime;
-        if (age > 600000 && pos.currentPnl > 0) {
-          logger.info(`⏱️ TIMEOUT PROFIT ${pos.symbol} | ${Math.floor(age/60000)}min | +${pos.currentPnl.toFixed(4)}$`);
-          await this._closePosition(pos, price, 'TIMEOUT');
+        // ── TIMEOUT réduit pour le testnet (prix quasi-statiques) ──
+        // 3min en profit → fermer | 5min force
+        const timeoutProfit = parseInt(process.env.TIMEOUT_PROFIT_MS || 180000);  // 3min par défaut
+        const timeoutForce  = parseInt(process.env.TIMEOUT_FORCE_MS  || 300000);  // 5min par défaut
+
+        if (age > timeoutProfit && pos.currentPnl > 0) {
+          logger.info(`⏱️ TIMEOUT PROFIT ${pos.symbol} | ${ageMin}min | +${pos.currentPnl.toFixed(4)}$`);
+          await this._closePosition(pos, price, 'TIMEOUT_PROFIT');
           continue;
         }
-        if (age > 900000) {
-          logger.warn(`⏱️ TIMEOUT FORCE ${pos.symbol} | ${Math.floor(age/60000)}min`);
+        if (age > timeoutForce) {
+          logger.warn(`⏱️ TIMEOUT FORCE ${pos.symbol} | ${ageMin}min | PnL:${pos.currentPnl.toFixed(4)}$`);
           await this._closePosition(pos, price, 'TIMEOUT_FORCE');
           continue;
         }
@@ -272,7 +356,7 @@ class Scalper {
 
     candidates.sort((a, b) => b.confidence - a.confidence);
 
-    // ── FIX: Traitement séquentiel (pas parallèle) pour éviter le race condition ──
+    // Séquentiel pour respecter maxPositions
     for (const cand of candidates) {
       if (this.positions.size >= this.maxPositions) break;
       await this._openPosition(cand.pair, cand.side, cand.confidence, cand.tpPct, cand.slPct);
@@ -298,8 +382,6 @@ class Scalper {
     if ((this.hourlyTrades[pair] || []).length >= this.maxHourly) return null;
 
     if ([...this.positions.values()].find(p => p.symbol === pair)) return null;
-
-    // ── FIX: Vérifier le verrou d'ouverture ──
     if (this._openingPairs.has(pair)) return null;
 
     let orderBook = null;
@@ -314,7 +396,7 @@ class Scalper {
     this.pairData[pair].analysis = analysis;
 
     const p = this.pairData[pair].price || 0;
-    logger.info(`📊 ${pair} @ ${p.toFixed(2)} | L:${analysis.longScore} S:${analysis.shortScore} | ${analysis.action}${analysis.side?' '+analysis.side:''} (${analysis.confidence}%)`);
+    logger.info(`📊 ${pair} @ ${p.toFixed(2)} | L:${analysis.longScore} S:${analysis.shortScore} | ${analysis.action}${analysis.side?' '+analysis.side:''} (${analysis.confidence}%) | TP:${analysis.tpPct}% SL:${analysis.slPct}%`);
 
     return analysis;
   }
@@ -323,18 +405,15 @@ class Scalper {
   // OUVRIR UNE POSITION
   // ================================================================
   async _openPosition(symbol, side, confidence, tpPct, slPct) {
-    // ── FIX: Vérifications atomiques renforcées ──
     if (this.positions.size >= this.maxPositions) return;
     if ([...this.positions.values()].find(p => p.symbol === symbol)) return;
 
-    // ── FIX: Verrou par paire — empêche deux ouvertures simultanées ──
     if (this._openingPairs.has(symbol)) {
       logger.warn(`⚠️ Ouverture déjà en cours pour ${symbol}, skip`);
       return;
     }
     this._openingPairs.add(symbol);
 
-    // ── FIX: Re-vérifier après avoir posé le verrou ──
     if (this.positions.size >= this.maxPositions || [...this.positions.values()].find(p => p.symbol === symbol)) {
       this._openingPairs.delete(symbol);
       return;
@@ -394,7 +473,7 @@ class Scalper {
 
       if (err.message.includes('notional') || err.message.includes('Notionnel') || err.message.includes('notionnel')) {
         this.pairBlacklist[symbol] = Date.now() + 600000;
-        logger.warn(`🚫 ${symbol} blacklisté 10min — notionnel insuffisant avec ${this.amount}$`);
+        logger.warn(`🚫 ${symbol} blacklisté 10min — notionnel insuffisant`);
       } else if (this.pairErrors[symbol] >= 3) {
         this.pairBlacklist[symbol] = Date.now() + 300000;
         logger.warn(`🚫 ${symbol} blacklisté 5min (${this.pairErrors[symbol]} erreurs)`);
@@ -403,7 +482,6 @@ class Scalper {
 
       this.lastTradeTime[symbol] = Date.now();
     } finally {
-      // ── FIX: Toujours libérer le verrou ──
       this._openingPairs.delete(symbol);
     }
   }
@@ -412,12 +490,10 @@ class Scalper {
   // FERMER UNE POSITION
   // ================================================================
   async _closePosition(pos, exitPrice, reason) {
-    // ── FIX: Retirer atomiquement de la Map — évite les doubles fermetures ──
     if (!this.positions.has(pos.id)) return;
     this.positions.delete(pos.id);
 
     try {
-      // ── FIX: Utiliser la quantité stockée dans la position (pas recalculée) ──
       if (pos.side === 'LONG') await binance.closeLong(pos.symbol, pos.qty);
       else                     await binance.closeShort(pos.symbol, pos.qty);
 
@@ -454,15 +530,13 @@ class Scalper {
       const sign  = pnl >= 0 ? '+' : '';
       logger.info(`${emoji} CLOSE ${pos.side} ${pos.symbol} @ ${exitPrice} | P&L: ${sign}${pnl.toFixed(4)}$ | ${reason} | ${Math.floor(duration/1000)}s`);
       tradeLogger.info({ event:'CLOSE', ...trade, timestamp:new Date().toISOString() });
-
       this._broadcast({ type:'POSITION_CLOSE', data:{ trade, stats:this.stats } });
 
     } catch (err) {
       logger.error(`❌ Close ${pos.symbol}: ${err.message}`);
-      // ── FIX: Si la fermeture API échoue, remettre la position dans la Map pour réessayer ──
-      // MAIS seulement si ce n'est pas une erreur "position inconnue" côté Binance
+      // Remettre la position si l'erreur n'est pas "position déjà fermée"
       if (!err.message.includes('Position') && !err.message.includes('position') && !err.message.includes('reduceOnly')) {
-        logger.warn(`🔄 Remise en Map de ${pos.symbol} après échec de fermeture`);
+        logger.warn(`🔄 Remise en Map de ${pos.symbol} après échec API`);
         this.positions.set(pos.id, pos);
       }
     }
