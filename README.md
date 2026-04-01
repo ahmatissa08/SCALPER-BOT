@@ -14,7 +14,7 @@ Bot de scalping ultra-rapide multi-positions sur Binance Futures.
 | **Multi-positions** | Jusqu'à N positions ouvertes simultanément |
 | **Multi-paires** | Surveille BTC, ETH, BNB, SOL en même temps |
 | **Levier** | x1 à x10 (x3 recommandé) |
-| **Trailing Stop** | Le SL monte avec le prix pour sécuriser les gains |
+| **Trailing Stop** | Le SL monte    le prix pour sécuriser les gains |
 | **TP/SL dynamiques** | Calibrés sur l'ATR (volatilité réelle du marché) |
 | **Timeout auto** | Ferme les positions après 15min max |
 | **Stop perte quotidien** | Arrêt automatique si perte > seuil configuré |
