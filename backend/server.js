@@ -131,7 +131,7 @@ wss.on('connection', (ws, req) => {
 server.listen(PORT, () => {
   logger.info(`\n${'='.repeat(60)}`);
   logger.info(`  ⚡ SCALPER BOT — Démarré`);
-  logger.info(`  🌐 Dashboard: http://localhost:${PORT}`);
+  logger.info(`🌐 Dashboard: ${process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`}`);
   logger.info(`  💹 Mode: ${(process.env.TRADE_MODE || 'testnet').toUpperCase()}`);
   logger.info(`  🎯 Stratégie: Scalping Multi-Paires Long/Short`);
   logger.info(`${'='.repeat(60)}\n`);
